@@ -1,0 +1,31 @@
+# SPDX-License-Identifier: MIT
+
+# Zephyr, West, Twister, and Cargo build outputs
+/build*/
+/twister-out*/
+/target/
+
+# Local Zephyr-generated Cargo and IDE state (may contain host paths)
+/.cargo/
+/.zephyr-overrides.json
+/.vscode/
+/.idea/
+/.jj/
+compile_commands.json
+
+# Local hardware/config overrides and private signing keys (never commit secrets)
+*.local.conf
+*.local.overlay
+*.pem
+*.key
+*.der
+*.pk8
+.env
+.env.*
+
+# OS and editor swap/metadata files
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*~

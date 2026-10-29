@@ -1,0 +1,35 @@
+/* SPDX-License-Identifier: MIT */
+
+/*
+ * Devicetree overlay for Circuit Dojo nRF9151 Feather (non-secure).
+ *
+ * Default switch output is mapped to Feather header pin D2 (P0.26), active-high.
+ * Update `&gpio0 26` (and polarity if needed) to match your relay or MOSFET
+ * driver circuit, or supply a local `*.local.overlay` via `-DDTC_OVERLAY_FILE`.
+ *
+ * Note: `compatible = "gpio-leds"` enables `zephyr-lang-rust` (`dt-rust.yaml`)
+ * to generate a safe `GpioPin` handle for the `switch0` alias, while
+ * `CONFIG_LED_GPIO=n` in `boards/circuitdojo_feather_nrf9151_ns.conf` prevents
+ * Zephyr's C `led_gpio` driver from claiming the same pin.
+ *
+ * Hardware fail-safe note: SoC GPIOs are high-impedance (floating) during
+ * power-on reset, MCUboot execution, and early boot until `switch_controller`
+ * configures `switch0` as an inactive output. Fit an external pull-down
+ * resistor (e.g., 10 kOhm to GND for active-high drivers, or pull-up to VDD
+ * for active-low drivers) on the relay/MOSFET gate so the load cannot glitch
+ * ON before firmware initialization completes.
+ */
+
+/ {
+	aliases {
+		switch0 = &switch_out;
+	};
+
+	outputs {
+		compatible = "gpio-leds";
+		switch_out: switch_out {
+			gpios = <&gpio0 26 GPIO_ACTIVE_HIGH>;
+			label = "Remote Switch Output";
+		};
+	};
+};

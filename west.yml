@@ -1,0 +1,25 @@
+# SPDX-License-Identifier: MIT
+---
+manifest:
+  remotes:
+    - name: circuitdojo
+      url-base: https://github.com/circuitdojo
+    - name: zephyrproject-rtos
+      url-base: https://github.com/zephyrproject-rtos
+
+  projects:
+    - name: nfed
+      remote: circuitdojo
+      repo-path: nrf9160-feather-examples-and-drivers.git
+      path: nfed
+      # Pinned commit on branch v3.4.x for reproducible builds
+      revision: 79ee909971558cbea852dd668134be6ef73adfe7
+      import: true
+    - name: zephyr-lang-rust
+      remote: zephyrproject-rtos
+      repo-path: zephyr-lang-rust.git
+      path: modules/lang/rust
+      revision: 6823b690ed2daf636323cbb8a10447d142752e1f
+
+  self:
+    path: remote_switch
