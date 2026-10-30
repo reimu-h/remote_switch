@@ -1,0 +1,46 @@
+# SPDX-License-Identifier: MIT
+
+menu "Remote switch"
+
+config REMOTE_SWITCH_KEY
+	string "Remote command key (64 hex digits)"
+	default ""
+	help
+	  32-byte pre-shared key, hex encoded, used to authenticate remote
+	  commands and replies with HMAC-SHA256. An empty or malformed value
+	  disables remote control (commands are dropped).
+
+	  Never commit a real key. Generate one into the git-ignored file
+	  `remote_switch.local.conf` with `tools/rsctl.py keygen`; CMakeLists.txt
+	  merges that file into the build automatically when it exists.
+
+config REMOTE_SWITCH_CELLULAR
+	bool "Remote control over cellular (LTE-M / NB-IoT)"
+	default y
+	depends on NRF_MODEM_LIB && LTE_LINK_CONTROL && LTE_LC_PDN_MODULE && NET_SOCKETS
+	help
+	  Attach to the cellular network and accept authenticated commands on a
+	  UDP port. The device sends nothing while idle and one small reply per
+	  authenticated command.
+
+if REMOTE_SWITCH_CELLULAR
+
+config REMOTE_SWITCH_UDP_PORT
+	int "UDP port for remote commands"
+	default 4242
+	range 1 65535
+
+config REMOTE_SWITCH_CELLULAR_STACK_SIZE
+	int "Cellular thread stack size"
+	default 4096
+
+config REMOTE_SWITCH_PDN_RECOVERY_TIMEOUT
+	int "Seconds without a PDN connection before forcing a re-attach"
+	default 300
+	range 60 86400
+
+endif # REMOTE_SWITCH_CELLULAR
+
+endmenu
+
+source "Kconfig.zephyr"

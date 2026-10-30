@@ -4,24 +4,24 @@
 # `west build -b circuitdojo_feather_nrf9151/nrf9151/ns --sysbuild`; upstream
 # `nfed` carries a legacy HWMv1 identifier (`circuitdojo_feather_nrf9151_ns`) in
 # `circuitdojo_feather_nrf9151_nrf9151_ns.yaml` that Twister skips during board
-# discovery, so Twister CI validates the nRF9151 Non-Secure + TF-M + MCUboot
-# sysbuild flow on `nrf9151dk/nrf9151/ns` and board DTS/Kconfig on
-# `circuitdojo_feather_nrf9151/nrf9151`.
+# discovery, so Twister CI validates the nRF9151 Non-Secure + TF-M + MCUboot +
+# modem sysbuild flow on `nrf9151dk/nrf9151/ns`. Secure-only targets are not
+# listed because the nRF91 modem library requires the non-secure build.
 sample:
   name: Remote Switch
-  description: Rust on Zephyr remote switch controller for nRF9151 Feather
+  description: Rust on Zephyr cellular remote switch controller for nRF9151 Feather
 common:
   sysbuild: true
   build_only: true
   filter: CONFIG_RUST_SUPPORTED
   platform_allow:
-    - circuitdojo_feather_nrf9151/nrf9151
     - nrf9151dk/nrf9151/ns
   integration_platforms:
     - nrf9151dk/nrf9151/ns
   tags:
     - gpio
     - input
+    - lte
     - mcuboot
     - rust
 tests:

@@ -3,14 +3,19 @@
 #![cfg_attr(target_os = "none", no_std)]
 #![allow(unexpected_cfgs)]
 
+pub mod protocol;
+pub mod remote;
+
 use core::ffi::c_int;
 #[cfg(not(target_os = "none"))]
-use core::sync::atomic::{AtomicU32, Ordering};
+use core::sync::atomic::{AtomicU32, AtomicU8, Ordering};
 
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::channel::Channel;
+use embassy_sync::once_lock::OnceLock;
 #[cfg(target_os = "none")]
-use log::{info, warn};
+use log::info;
+use log::warn;
 #[cfg(target_os = "none")]
 use static_cell::StaticCell;
 #[cfg(target_os = "none")]
@@ -20,9 +25,12 @@ use zephyr::embassy::Executor;
 #[cfg(all(target_os = "none", dt = "aliases::switch0"))]
 use zephyr::raw::ZR_GPIO_OUTPUT_INACTIVE;
 #[cfg(target_os = "none")]
-use zephyr::sync::atomic::{AtomicU32, Ordering};
+use zephyr::sync::atomic::{AtomicU32, AtomicU8, Ordering};
 #[cfg(target_os = "none")]
 use zephyr_panic as _;
+
+use protocol::Key;
+use remote::{ReplayGuard, SwitchPort, SwitchState};
 
 /// Capacity of the lock-free command queue shared between C callbacks and the
 /// async `switch_controller` task.
@@ -32,6 +40,9 @@ pub const COMMAND_QUEUE_CAPACITY: usize = 8;
 extern "C" {
     fn board_status_led_set(on: bool);
     fn board_confirm_image();
+    fn board_counter_load(value: *mut u64) -> bool;
+    fn board_counter_store(value: u64) -> c_int;
+    fn cellular_start() -> c_int;
 }
 
 /// Commands accepted by the switch state machine (from local button or authenticated remote radio).
@@ -140,20 +151,114 @@ pub extern "C" fn rust_on_local_button_press() -> bool {
     enqueue_command(SwitchCommand::Toggle)
 }
 
-/// Entry point for authenticated remote radio transports (MQTTS / HTTPS / CoAP-DTLS / DECT NR+).
+const STATE_OFF: u8 = 0;
+const STATE_ON: u8 = 1;
+const STATE_UNAVAILABLE: u8 = 2;
+
+/// Switch state published by `switch_controller` for remote status queries. Starts as
+/// unavailable so remote commands are refused until the output is initialized.
+static SWITCH_STATE: AtomicU8 = AtomicU8::new(STATE_UNAVAILABLE);
+
+fn publish_switch_state(state: SwitchState) {
+    let raw = match state {
+        SwitchState::Off => STATE_OFF,
+        SwitchState::On => STATE_ON,
+        SwitchState::Unavailable => STATE_UNAVAILABLE,
+    };
+    SWITCH_STATE.store(raw, Ordering::Relaxed);
+}
+
+fn published_switch_state() -> SwitchState {
+    match SWITCH_STATE.load(Ordering::Relaxed) {
+        STATE_OFF => SwitchState::Off,
+        STATE_ON => SwitchState::On,
+        _ => SwitchState::Unavailable,
+    }
+}
+
+/// Pre-shared key for remote commands. Remote control stays disabled while unset.
+static REMOTE_KEY: OnceLock<Key> = OnceLock::new();
+
+/// Replay protection shared by every remote transport.
+static REPLAY_GUARD: ReplayGuard = ReplayGuard::new();
+
+/// [`SwitchPort`] backed by the firmware's command queue, published state, and flash.
+struct FirmwarePort;
+
+impl SwitchPort for FirmwarePort {
+    fn state(&self) -> SwitchState {
+        published_switch_state()
+    }
+
+    fn request(&self, on: bool) -> bool {
+        enqueue_command(SwitchCommand::Set(on))
+    }
+
+    #[cfg(target_os = "none")]
+    fn persist_counter(&self, counter: u64) -> bool {
+        // SAFETY: `board_counter_store` takes its argument by value, is only reached from
+        // thread context (the cellular and shell threads), and serializes flash writes with
+        // its own mutex.
+        unsafe { board_counter_store(counter) == 0 }
+    }
+
+    #[cfg(not(target_os = "none"))]
+    fn persist_counter(&self, _counter: u64) -> bool {
+        true
+    }
+}
+
+/// Verifies and applies one remote message, writing any reply into `reply`.
 ///
-/// # Security Preconditions
-/// Callers **must** authenticate the remote peer, authorize the operation, and enforce
-/// replay protection before calling this function to actuate physical switch hardware.
-/// Never wire unauthenticated or cleartext transports (such as SMS) to this hook.
+/// Returns the reply length, or 0 when the message must be dropped silently.
+fn handle_remote_message(message: &[u8], reply: &mut [u8]) -> usize {
+    let Some(key) = REMOTE_KEY.try_get() else {
+        warn!("Dropped remote message: remote control is disabled (no key configured)");
+        return 0;
+    };
+    match remote::handle_message(key, &REPLAY_GUARD, &FirmwarePort, message) {
+        Ok((status, counter)) => protocol::encode_reply(key, status, counter, reply)
+            .unwrap_or_else(|| {
+                warn!("Reply buffer too small ({} bytes)", reply.len());
+                0
+            }),
+        Err(err) => {
+            warn!("Dropped remote message ({} bytes): {err:?}", message.len());
+            0
+        }
+    }
+}
+
+/// Entry point for every remote transport (UDP datagrams, debug shell, ...).
 ///
-/// # ABI Safety & Concurrency
-/// Accepts `c_int` (`0` = `OFF`, non-zero = `ON`) rather than raw Rust `bool` across
-/// `extern "C"` so no integer bit-pattern from C can cause Undefined Behavior.
-/// Lock-free, allocation-free, and ISR-safe. Returns `true` if queued, `false` if full.
+/// Authenticates `message` (see [`protocol`]), enforces replay protection, applies the
+/// command, and writes the authenticated reply into `reply`. Returns the number of reply
+/// bytes to send back to the sender, or 0 if the message was rejected and must be
+/// dropped without a reply.
+///
+/// # Safety
+/// `message` must be valid for reads of `message_len` bytes and `reply` must be valid
+/// for writes of `reply_capacity` bytes for the duration of the call, and the two
+/// buffers must not overlap. Must be called from thread context (it may write flash).
 #[no_mangle]
-pub extern "C" fn rust_on_remote_command(turn_on: c_int) -> bool {
-    enqueue_command(SwitchCommand::Set(turn_on != 0))
+pub unsafe extern "C" fn rust_handle_remote_message(
+    message: *const u8,
+    message_len: usize,
+    reply: *mut u8,
+    reply_capacity: usize,
+) -> c_int {
+    if message.is_null() || reply.is_null() {
+        return 0;
+    }
+    // SAFETY: The caller guarantees `message` is valid for `message_len` bytes of reads and
+    // `reply` for `reply_capacity` bytes of writes, and that they do not overlap.
+    let (message, reply) = unsafe {
+        (
+            core::slice::from_raw_parts(message, message_len),
+            core::slice::from_raw_parts_mut(reply, reply_capacity),
+        )
+    };
+    c_int::try_from(handle_remote_message(message, reply)).unwrap_or(0)
 }
 
 #[cfg(target_os = "none")]
@@ -213,10 +318,12 @@ async fn switch_controller(mut switch_pin: Option<GpioPin>) -> ! {
     if let Some(pin) = switch_pin.as_mut() {
         pin.set(false);
         set_status_led(false);
+        publish_switch_state(SwitchState::Off);
         info!("Switch state -> OFF");
         info!("Ready: press button to toggle `switch0` output");
     } else {
         set_status_led(false);
+        publish_switch_state(SwitchState::Unavailable);
         warn!("Degraded mode: `switch0` output unavailable; switch forced OFF");
     }
     if should_confirm_boot_image(switch_pin.is_some(), cfg!(dt = "aliases::switch0")) {
@@ -237,6 +344,11 @@ async fn switch_controller(mut switch_pin: Option<GpioPin>) -> ! {
                     pin.set(new_state);
                 }
                 set_status_led(new_state);
+                publish_switch_state(if new_state {
+                    SwitchState::On
+                } else {
+                    SwitchState::Off
+                });
                 info!("Switch state -> {}", if new_state { "ON" } else { "OFF" });
             }
             StateTransition::Unchanged(_) => {}
@@ -245,6 +357,29 @@ async fn switch_controller(mut switch_pin: Option<GpioPin>) -> ! {
             }
         }
     }
+}
+
+/// Loads the remote key and the persisted replay counter. Remote commands are dropped
+/// until this succeeds.
+#[cfg(target_os = "none")]
+fn init_remote_control() {
+    let Some(key) = Key::from_hex(zephyr::kconfig::CONFIG_REMOTE_SWITCH_KEY) else {
+        warn!("CONFIG_REMOTE_SWITCH_KEY is not 64 hex digits; remote control disabled");
+        return;
+    };
+    let mut last_counter = 0u64;
+    // SAFETY: `last_counter` is a valid, exclusively borrowed `u64` for the duration of
+    // the call, and `rust_main` runs in thread context before any remote transport starts.
+    if unsafe { board_counter_load(&mut last_counter) } {
+        REPLAY_GUARD.restore(last_counter);
+    }
+    if REMOTE_KEY.init(key).is_err() {
+        warn!("Remote key already initialized");
+    }
+    info!(
+        "Remote control enabled (last counter {})",
+        REPLAY_GUARD.last()
+    );
 }
 
 #[cfg(target_os = "none")]
@@ -258,6 +393,14 @@ extern "C" fn rust_main() {
 
     info!("Booting remote_switch (Rust on Zephyr)");
     let switch_pin = init_switch_pin();
+    init_remote_control();
+
+    // SAFETY: Called once from thread context after the remote key and replay counter are
+    // initialized, so the cellular thread never observes a half-initialized handler.
+    let err = unsafe { cellular_start() };
+    if err != 0 {
+        warn!("Cellular link not started ({err}); remote control unavailable");
+    }
 
     let executor = EXECUTOR.init(Executor::new());
     executor.run(|spawner| {
@@ -367,32 +510,76 @@ mod tests {
     }
 
     #[test]
-    fn ffi_button_and_remote_commands_normalize_all_c_int_values() {
-        with_isolated_queue(|| {
-            assert!(rust_on_local_button_press());
-            assert!(rust_on_remote_command(0));
-            assert!(rust_on_remote_command(1));
-            assert!(rust_on_remote_command(2));
-            assert!(rust_on_remote_command(0x100));
-            assert!(rust_on_remote_command(-1));
-            assert!(rust_on_remote_command(c_int::MAX));
-            assert!(rust_on_remote_command(c_int::MIN));
+    fn switch_state_publication_round_trips() {
+        let _guard = FFI_TEST_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
+        for state in [SwitchState::On, SwitchState::Unavailable, SwitchState::Off] {
+            publish_switch_state(state);
+            assert_eq!(published_switch_state(), state);
+            assert_eq!(FirmwarePort.state(), state);
+        }
+    }
 
-            let expected = [
-                SwitchCommand::Toggle,
-                SwitchCommand::Set(false),
-                SwitchCommand::Set(true),
-                SwitchCommand::Set(true),
-                SwitchCommand::Set(true),
-                SwitchCommand::Set(true),
-                SwitchCommand::Set(true),
-                SwitchCommand::Set(true),
-            ];
-            for cmd in expected {
-                assert_eq!(COMMAND_CHANNEL.try_receive().unwrap(), cmd);
-            }
+    fn call_ffi(message: &[u8]) -> Option<String> {
+        let mut reply = [0u8; protocol::MAX_MESSAGE_LEN];
+        // SAFETY: Both buffers are valid for their full lengths and do not overlap.
+        let len = unsafe {
+            rust_handle_remote_message(
+                message.as_ptr(),
+                message.len(),
+                reply.as_mut_ptr(),
+                reply.len(),
+            )
+        };
+        let len = usize::try_from(len).unwrap();
+        (len > 0).then(|| String::from_utf8(reply[..len].to_vec()).unwrap())
+    }
+
+    #[test]
+    fn ffi_remote_message_authenticates_applies_and_replies() {
+        let key = Key::new([0x42; protocol::KEY_LEN]);
+        let request = |command, counter| {
+            let mut buf = [0u8; protocol::MAX_MESSAGE_LEN];
+            let len = protocol::encode_request(&key, command, counter, &mut buf).unwrap();
+            buf[..len].to_vec()
+        };
+        let reply = |status, counter| {
+            let mut buf = [0u8; protocol::MAX_MESSAGE_LEN];
+            let len = protocol::encode_reply(&key, status, counter, &mut buf).unwrap();
+            String::from_utf8(buf[..len].to_vec()).unwrap()
+        };
+
+        with_isolated_queue(|| {
+            let _ = REMOTE_KEY.init(key.clone());
+            publish_switch_state(SwitchState::Off);
+            let older = REPLAY_GUARD.last() + 1;
+            let fresh = older + 1;
+            use protocol::{RemoteCommand, ReplyStatus};
+
+            assert_eq!(
+                call_ffi(&request(RemoteCommand::On, fresh)),
+                Some(reply(ReplyStatus::On, fresh))
+            );
+            assert_eq!(
+                COMMAND_CHANNEL.try_receive().unwrap(),
+                SwitchCommand::Set(true)
+            );
+
+            // Forged, stale, and null inputs never reach the switch.
+            let mut forged = request(RemoteCommand::Off, fresh + 1);
+            forged[0] = b'x';
+            assert_eq!(call_ffi(&forged), None);
+            assert_eq!(
+                call_ffi(&request(RemoteCommand::Off, older)),
+                Some(reply(ReplyStatus::Stale, fresh))
+            );
+            let mut buf = [0u8; 8];
+            // SAFETY: Null pointers are rejected before any dereference.
+            assert_eq!(
+                unsafe { rust_handle_remote_message(core::ptr::null(), 4, buf.as_mut_ptr(), 8) },
+                0
+            );
             assert!(COMMAND_CHANNEL.try_receive().is_err());
-            assert_eq!(take_dropped_commands(), 0);
+            publish_switch_state(SwitchState::Off);
         });
     }
 
@@ -403,14 +590,14 @@ mod tests {
                 if i % 2 == 0 {
                     assert!(rust_on_local_button_press());
                 } else {
-                    assert!(rust_on_remote_command(1));
+                    assert!(FirmwarePort.request(true));
                 }
             }
             assert_eq!(take_dropped_commands(), 0);
 
             assert!(!rust_on_local_button_press());
-            assert!(!rust_on_remote_command(0));
-            assert!(!rust_on_remote_command(42));
+            assert!(!FirmwarePort.request(false));
+            assert!(!FirmwarePort.request(true));
             assert_eq!(take_dropped_commands(), 3);
             assert_eq!(take_dropped_commands(), 0);
 
@@ -419,7 +606,7 @@ mod tests {
                 COMMAND_CHANNEL.try_receive().unwrap(),
                 SwitchCommand::Toggle
             );
-            assert!(rust_on_remote_command(0));
+            assert!(FirmwarePort.request(false));
             assert_eq!(take_dropped_commands(), 0);
 
             for i in 1..COMMAND_QUEUE_CAPACITY {

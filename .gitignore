@@ -4,6 +4,7 @@
 /build*/
 /twister-out*/
 /target/
+__pycache__/
 
 # Local Zephyr-generated Cargo and IDE state (may contain host paths)
 /.cargo/

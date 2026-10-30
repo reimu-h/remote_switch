@@ -5,11 +5,14 @@
  *   1. Onboard nPM1300 status LED (channel 2, host-controlled blue LED).
  *   2. Debounced button events via Zephyr's gpio-keys input subsystem.
  *   3. MCUboot runtime image confirmation after safe application startup.
+ *   4. Flash persistence of the remote-command replay counter (settings/NVS).
  */
 
 #include "board_io.h"
 
+#include <errno.h>
 #include <stdbool.h>
+#include <stdint.h>
 
 #include <zephyr/device.h>
 #include <zephyr/devicetree.h>
@@ -27,6 +30,10 @@
 
 #if IS_ENABLED(CONFIG_MCUBOOT_IMG_MANAGER)
 #include <zephyr/dfu/mcuboot.h>
+#endif
+
+#if IS_ENABLED(CONFIG_SETTINGS)
+#include <zephyr/settings/settings.h>
 #endif
 
 LOG_MODULE_REGISTER(board_io, LOG_LEVEL_INF);
@@ -88,6 +95,96 @@ void board_confirm_image(void)
 	}
 #endif
 }
+
+#if IS_ENABLED(CONFIG_SETTINGS)
+#define COUNTER_SETTINGS_KEY "remote_switch/ctr"
+
+/* Serializes flash writes and guards `stored_counter`/`settings_ready`. */
+static K_MUTEX_DEFINE(counter_lock);
+static uint64_t stored_counter;
+static bool settings_ready;
+
+static int counter_settings_init_locked(void)
+{
+	if (!settings_ready) {
+		int err = settings_subsys_init();
+
+		if (err) {
+			LOG_ERR("Settings init failed: %d", err);
+			return err;
+		}
+		settings_ready = true;
+	}
+	return 0;
+}
+
+static int counter_load_cb(const char *key, size_t len, settings_read_cb read_cb, void *cb_arg,
+			   void *param)
+{
+	uint64_t *out = param;
+
+	/* Only accept the exact key (no sub-keys) with the expected size. */
+	if ((key != NULL && key[0] != '\0') || len != sizeof(*out)) {
+		return 0;
+	}
+	return read_cb(cb_arg, out, sizeof(*out)) == sizeof(*out) ? 1 : 0;
+}
+
+bool board_counter_load(uint64_t *value)
+{
+	uint64_t loaded = 0;
+	bool found = false;
+
+	if (value == NULL || k_is_in_isr()) {
+		return false;
+	}
+
+	k_mutex_lock(&counter_lock, K_FOREVER);
+	if (counter_settings_init_locked() == 0 &&
+	    settings_load_subtree_direct(COUNTER_SETTINGS_KEY, counter_load_cb, &loaded) == 0 &&
+	    loaded != 0) {
+		stored_counter = MAX(stored_counter, loaded);
+		*value = loaded;
+		found = true;
+	}
+	k_mutex_unlock(&counter_lock);
+	return found;
+}
+
+int board_counter_store(uint64_t value)
+{
+	int err;
+
+	if (k_is_in_isr()) {
+		return -EWOULDBLOCK;
+	}
+
+	k_mutex_lock(&counter_lock, K_FOREVER);
+	err = counter_settings_init_locked();
+	if (err == 0 && value > stored_counter) {
+		err = settings_save_one(COUNTER_SETTINGS_KEY, &value, sizeof(value));
+		if (err == 0) {
+			stored_counter = value;
+		} else {
+			LOG_ERR("Failed to store replay counter: %d", err);
+		}
+	}
+	k_mutex_unlock(&counter_lock);
+	return err;
+}
+#else
+bool board_counter_load(uint64_t *value)
+{
+	ARG_UNUSED(value);
+	return false;
+}
+
+int board_counter_store(uint64_t value)
+{
+	ARG_UNUSED(value);
+	return -ENOTSUP;
+}
+#endif /* CONFIG_SETTINGS */
 
 #if HAS_SW0_INPUT
 static void on_button_input(struct input_event *evt, void *user_data)
