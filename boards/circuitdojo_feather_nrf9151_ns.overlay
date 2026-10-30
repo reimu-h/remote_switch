@@ -7,17 +7,19 @@
  * Update `&gpio0 26` (and polarity if needed) to match your relay or MOSFET
  * driver circuit, or supply a local `*.local.overlay` via `-DDTC_OVERLAY_FILE`.
  *
- * Note: `compatible = "gpio-leds"` enables `zephyr-lang-rust` (`dt-rust.yaml`)
- * to generate a safe `GpioPin` handle for the `switch0` alias, while
+ * Note: `compatible = "gpio-leds"` provides the `gpios` binding for the
+ * `switch0` alias (detected via `cfg!(dt = "aliases::switch0")` in Rust and
+ * `GPIO_DT_SPEC_GET(DT_ALIAS(switch0), gpios)` in `src/board_io.c`), while
  * `CONFIG_LED_GPIO=n` in `boards/circuitdojo_feather_nrf9151_ns.conf` prevents
  * Zephyr's C `led_gpio` driver from claiming the same pin.
  *
  * Hardware fail-safe note: SoC GPIOs are high-impedance (floating) during
- * power-on reset, MCUboot execution, and early boot until `switch_controller`
- * configures `switch0` as an inactive output. Fit an external pull-down
- * resistor (e.g., 10 kOhm to GND for active-high drivers, or pull-up to VDD
- * for active-low drivers) on the relay/MOSFET gate so the load cannot glitch
- * ON before firmware initialization completes.
+ * power-on reset, MCUboot execution, TF-M startup, and early kernel boot until
+ * `board_switch_early_init` (`POST_KERNEL`) configures `switch0` as an
+ * inactive output. Fit an external pull-down resistor (e.g., 10 kOhm to GND
+ * for active-high drivers, or pull-up to VDD for active-low drivers) on the
+ * relay/MOSFET gate so the load cannot glitch ON before firmware
+ * initialization completes.
  */
 
 / {

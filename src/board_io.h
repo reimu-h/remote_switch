@@ -1,8 +1,8 @@
 /* SPDX-License-Identifier: MIT */
 /*
- * C/Rust FFI boundary declarations for board-level status LED, local button
- * input, MCUboot image confirmation, replay-counter storage, and the
- * authenticated remote message handler.
+ * C/Rust FFI boundary declarations for the switch GPIO output, status LED,
+ * local button input, hardware watchdog, MCUboot image confirmation,
+ * replay-counter storage, and the authenticated remote message handler.
  */
 
 #ifndef REMOTE_SWITCH_BOARD_IO_H_
@@ -23,6 +23,29 @@ extern "C" {
 #define REMOTE_MESSAGE_MAX_LEN 64
 
 /**
+ * @brief Initialize (or verify early-boot initialization of) `aliases::switch0`
+ *        in its safe inactive (OFF) state.
+ *
+ * Thread context only. Checks both GPIO controller readiness and the driver
+ * return code from configuring/driving the pin inactive.
+ *
+ * @return true if `switch0` is present and driven inactive, false otherwise.
+ */
+bool board_switch_init(void);
+
+/**
+ * @brief Drive the `aliases::switch0` output active (ON) or inactive (OFF).
+ *
+ * Thread context only. If the GPIO driver rejects the write, `switch0` is
+ * reconfigured as `GPIO_DISCONNECTED` (so the external pull resistor can return
+ * the load to its safe inactive state) and marked unavailable.
+ *
+ * @param on true to drive active (ON), false to drive inactive (OFF).
+ * @return 0 on success, negative errno on failure or when unavailable.
+ */
+int board_switch_set(bool on);
+
+/**
  * @brief Update the onboard host-controlled status LED.
  *
  * Must be called from thread context only because the underlying PMIC LED
@@ -41,6 +64,24 @@ void board_status_led_set(bool on);
  * CONFIG_MCUBOOT_IMG_MANAGER is disabled or the image is already confirmed.
  */
 void board_confirm_image(void);
+
+/**
+ * @brief Arm `aliases::watchdog0` and start the periodic tick timer that wakes
+ *        `switch_controller` via `rust_on_watchdog_tick()`.
+ *
+ * Thread context only. Safe no-op returning 0 when
+ * `CONFIG_REMOTE_SWITCH_WATCHDOG` is disabled or `watchdog0` is absent.
+ *
+ * @return 0 on success, negative errno on failure.
+ */
+int board_watchdog_start(void);
+
+/**
+ * @brief Feed the hardware watchdog channel armed by `board_watchdog_start()`.
+ *
+ * Thread context only (called from `switch_controller` on the executor thread).
+ */
+void board_watchdog_feed(void);
 
 /**
  * @brief Load the last accepted remote-command counter from flash.
@@ -74,6 +115,14 @@ int board_counter_store(uint64_t value);
  * @return true if enqueued, false if dropped because the command queue is full.
  */
 bool rust_on_local_button_press(void);
+
+/**
+ * @brief Wake `switch_controller` from the periodic watchdog timer ISR so the
+ *        executor task feeds the hardware watchdog.
+ *
+ * Lock-free, heap-allocation-free, and safe to invoke from ISR context.
+ */
+void rust_on_watchdog_tick(void);
 
 /**
  * @brief Authenticate and apply one remote message from any transport.

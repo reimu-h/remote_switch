@@ -6,6 +6,8 @@
 #ifndef REMOTE_SWITCH_CELLULAR_H_
 #define REMOTE_SWITCH_CELLULAR_H_
 
+#include <stdbool.h>
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -23,9 +25,20 @@ extern "C" {
  */
 int cellular_start(void);
 
+/**
+ * @brief Check whether the cellular transport thread is making forward progress.
+ *
+ * Safe to call from any thread context. Returns true when cellular support or
+ * watchdog supervision is disabled, before `cellular_start()` has been called,
+ * or while the cellular thread has recorded a heartbeat within
+ * `CONFIG_REMOTE_SWITCH_CELLULAR_WATCHDOG_TIMEOUT` seconds.
+ *
+ * @return true if healthy (or inactive), false if unresponsive.
+ */
+bool cellular_is_healthy(void);
+
 #ifdef __cplusplus
 }
 #endif
 
 #endif /* REMOTE_SWITCH_CELLULAR_H_ */
-

@@ -5,8 +5,11 @@ cmake_minimum_required(VERSION 3.21.0)
 # Merge the git-ignored remote-control key (README "Setup") into the
 # application configuration when present. Zephyr combines this with the
 # sysbuild-provided EXTRA_CONF_FILE (sysbuild/remote_switch.conf).
+# CONFIGURE_DEPENDS makes Ninja re-run CMake if the key file is created or
+# deleted after an initial build.
 set(REMOTE_SWITCH_LOCAL_CONF ${CMAKE_CURRENT_LIST_DIR}/remote_switch.local.conf)
-if(EXISTS ${REMOTE_SWITCH_LOCAL_CONF})
+file(GLOB REMOTE_SWITCH_LOCAL_CONF_MATCH CONFIGURE_DEPENDS "${REMOTE_SWITCH_LOCAL_CONF}")
+if(REMOTE_SWITCH_LOCAL_CONF_MATCH)
   message(STATUS "remote_switch: using ${REMOTE_SWITCH_LOCAL_CONF}")
   list(APPEND EXTRA_CONF_FILE ${REMOTE_SWITCH_LOCAL_CONF})
 else()
@@ -19,7 +22,7 @@ project(remote_switch)
 
 rust_cargo_application()
 target_sources(app PRIVATE src/board_io.c src/cellular.c)
-target_sources_ifdef(CONFIG_SHELL app PRIVATE src/remote_shell.c)
+target_sources_ifdef(CONFIG_REMOTE_SWITCH_DEBUG_SHELL app PRIVATE src/remote_shell.c)
 set_source_files_properties(
   src/board_io.c
   src/cellular.c

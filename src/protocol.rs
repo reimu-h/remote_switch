@@ -131,6 +131,9 @@ pub enum RequestError {
     BadCounter,
     /// Tag is malformed or does not match the message.
     BadTag,
+    /// Duplicate or stale message exceeded the non-fresh reply budget before a fresh
+    /// counter arrived.
+    RateLimited,
 }
 
 /// Parses `message` and verifies its tag against `key` in constant time.

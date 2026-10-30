@@ -13,17 +13,14 @@ use core::sync::atomic::{AtomicU32, AtomicU8, Ordering};
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::channel::Channel;
 use embassy_sync::once_lock::OnceLock;
+use embassy_sync::signal::Signal;
 #[cfg(target_os = "none")]
 use log::info;
 use log::warn;
 #[cfg(target_os = "none")]
 use static_cell::StaticCell;
 #[cfg(target_os = "none")]
-use zephyr::device::gpio::GpioPin;
-#[cfg(target_os = "none")]
 use zephyr::embassy::Executor;
-#[cfg(all(target_os = "none", dt = "aliases::switch0"))]
-use zephyr::raw::ZR_GPIO_OUTPUT_INACTIVE;
 #[cfg(target_os = "none")]
 use zephyr::sync::atomic::{AtomicU32, AtomicU8, Ordering};
 #[cfg(target_os = "none")]
@@ -38,11 +35,16 @@ pub const COMMAND_QUEUE_CAPACITY: usize = 8;
 
 #[cfg(target_os = "none")]
 extern "C" {
+    fn board_switch_init() -> bool;
+    fn board_switch_set(on: bool) -> c_int;
     fn board_status_led_set(on: bool);
     fn board_confirm_image();
+    fn board_watchdog_start() -> c_int;
+    fn board_watchdog_feed();
     fn board_counter_load(value: *mut u64) -> bool;
     fn board_counter_store(value: u64) -> c_int;
     fn cellular_start() -> c_int;
+    fn cellular_is_healthy() -> bool;
 }
 
 /// Commands accepted by the switch state machine (from local button or authenticated remote radio).
@@ -121,6 +123,8 @@ static EXECUTOR: StaticCell<Executor> = StaticCell::new();
 static COMMAND_CHANNEL: Channel<CriticalSectionRawMutex, SwitchCommand, COMMAND_QUEUE_CAPACITY> =
     Channel::new();
 
+static WATCHDOG_SIGNAL: Signal<CriticalSectionRawMutex, ()> = Signal::new();
+
 static DROPPED_COMMANDS: AtomicU32 = AtomicU32::new(0);
 
 /// Enqueues a [`SwitchCommand`] without blocking or allocating.
@@ -140,7 +144,7 @@ fn enqueue_command(cmd: SwitchCommand) -> bool {
 /// since the previous call.
 #[must_use]
 pub fn take_dropped_commands() -> u32 {
-    DROPPED_COMMANDS.swap(0, Ordering::Relaxed)
+    DROPPED_COMMANDS.swap(0, Ordering::AcqRel)
 }
 
 /// Called from `src/board_io.c` when a debounced local button press occurs.
@@ -151,25 +155,35 @@ pub extern "C" fn rust_on_local_button_press() -> bool {
     enqueue_command(SwitchCommand::Toggle)
 }
 
+/// Called from `src/board_io.c`'s periodic watchdog timer ISR so `switch_controller`
+/// wakes on the Embassy executor thread and feeds the hardware watchdog.
+///
+/// Lock-free, allocation-free, and ISR-safe.
+#[no_mangle]
+pub extern "C" fn rust_on_watchdog_tick() {
+    WATCHDOG_SIGNAL.signal(());
+}
+
 const STATE_OFF: u8 = 0;
 const STATE_ON: u8 = 1;
 const STATE_UNAVAILABLE: u8 = 2;
 
-/// Switch state published by `switch_controller` for remote status queries. Starts as
-/// unavailable so remote commands are refused until the output is initialized.
+/// Switch state published for remote status queries. Starts as unavailable until
+/// `SwitchOutput::init()` verifies `aliases::switch0` before remote transports start.
 static SWITCH_STATE: AtomicU8 = AtomicU8::new(STATE_UNAVAILABLE);
 
+#[cfg(any(target_os = "none", test))]
 fn publish_switch_state(state: SwitchState) {
     let raw = match state {
         SwitchState::Off => STATE_OFF,
         SwitchState::On => STATE_ON,
         SwitchState::Unavailable => STATE_UNAVAILABLE,
     };
-    SWITCH_STATE.store(raw, Ordering::Relaxed);
+    SWITCH_STATE.store(raw, Ordering::Release);
 }
 
 fn published_switch_state() -> SwitchState {
-    match SWITCH_STATE.load(Ordering::Relaxed) {
+    match SWITCH_STATE.load(Ordering::Acquire) {
         STATE_OFF => SwitchState::Off,
         STATE_ON => SwitchState::On,
         _ => SwitchState::Unavailable,
@@ -262,6 +276,48 @@ pub unsafe extern "C" fn rust_handle_remote_message(
 }
 
 #[cfg(target_os = "none")]
+struct SwitchOutput {
+    available: bool,
+}
+
+#[cfg(target_os = "none")]
+impl SwitchOutput {
+    fn init() -> Self {
+        // SAFETY: Invoked once from `rust_main` in Zephyr thread context before any
+        // remote transport or executor task runs. `board_switch_init` checks
+        // `k_is_in_isr()`, verifies GPIO readiness, and checks the driver return code.
+        let available = unsafe { board_switch_init() };
+        publish_switch_state(if available {
+            SwitchState::Off
+        } else {
+            SwitchState::Unavailable
+        });
+        Self { available }
+    }
+
+    const fn is_available(&self) -> bool {
+        self.available
+    }
+
+    fn set(&mut self, on: bool) -> bool {
+        if !self.available {
+            return false;
+        }
+        // SAFETY: Invoked only from `switch_controller` in Zephyr thread context.
+        // `board_switch_set` checks `k_is_in_isr()` and returns negative errno on failure.
+        let err = unsafe { board_switch_set(on) };
+        if err < 0 {
+            warn!("GPIO write to `switch0` failed ({err}); marking output unavailable");
+            self.available = false;
+            publish_switch_state(SwitchState::Unavailable);
+            false
+        } else {
+            true
+        }
+    }
+}
+
+#[cfg(target_os = "none")]
 fn set_status_led(on: bool) {
     // SAFETY: `set_status_led` is only invoked from `switch_controller`, which runs inside
     // the Zephyr thread-backed Embassy executor (never in ISR context). `board_status_led_set`
@@ -283,24 +339,65 @@ fn confirm_boot_image() {
     }
 }
 
-#[cfg(all(target_os = "none", dt = "aliases::switch0"))]
-fn init_switch_pin() -> Option<GpioPin> {
-    let Some(mut pin) = zephyr::devicetree::aliases::switch0::get_instance() else {
-        warn!("Devicetree alias `switch0` GPIO instance already taken or unavailable");
-        return None;
-    };
-    if !pin.is_ready() {
-        warn!("Devicetree alias `switch0` GPIO controller is not ready");
-        return None;
+#[cfg(target_os = "none")]
+fn start_watchdog() {
+    // SAFETY: Invoked once from `rust_main` in Zephyr thread context before entering the
+    // executor loop. `board_watchdog_start` checks `k_is_in_isr()` and guards single-start
+    // initialization with an atomic CAS.
+    let err = unsafe { board_watchdog_start() };
+    if err < 0 {
+        warn!("Hardware watchdog not started ({err})");
     }
-    pin.configure(ZR_GPIO_OUTPUT_INACTIVE);
-    Some(pin)
 }
 
-#[cfg(all(target_os = "none", not(dt = "aliases::switch0")))]
-fn init_switch_pin() -> Option<GpioPin> {
-    warn!("Devicetree alias `switch0` is not defined");
-    None
+#[cfg(target_os = "none")]
+fn feed_watchdog() {
+    // SAFETY: Invoked only from `switch_controller` in Zephyr thread context.
+    // `board_watchdog_feed` checks `k_is_in_isr()` and is a no-op if the watchdog is not armed.
+    unsafe {
+        board_watchdog_feed();
+    }
+}
+
+#[cfg(target_os = "none")]
+fn is_cellular_healthy() -> bool {
+    // SAFETY: `cellular_is_healthy` only performs atomic reads of static state and
+    // `k_uptime_seconds()`, and is safe to call from any thread context.
+    unsafe { cellular_is_healthy() }
+}
+
+#[cfg(target_os = "none")]
+fn supervise_watchdog() {
+    if is_cellular_healthy() {
+        feed_watchdog();
+    } else {
+        warn!("Cellular transport unresponsive; withholding watchdog feed");
+    }
+}
+
+#[cfg(target_os = "none")]
+enum ControllerEvent {
+    Command(SwitchCommand),
+    WatchdogTick,
+}
+
+#[cfg(target_os = "none")]
+async fn next_controller_event() -> ControllerEvent {
+    use core::future::Future;
+    use core::task::Poll;
+
+    let mut wdt = core::pin::pin!(WATCHDOG_SIGNAL.wait());
+    let mut cmd = core::pin::pin!(COMMAND_CHANNEL.receive());
+    core::future::poll_fn(|cx| {
+        if let Poll::Ready(()) = wdt.as_mut().poll(cx) {
+            return Poll::Ready(ControllerEvent::WatchdogTick);
+        }
+        if let Poll::Ready(command) = cmd.as_mut().poll(cx) {
+            return Poll::Ready(ControllerEvent::Command(command));
+        }
+        Poll::Pending
+    })
+    .await
 }
 
 #[cfg(target_os = "none")]
@@ -313,43 +410,51 @@ fn log_dropped_commands_if_any() {
 
 #[cfg(target_os = "none")]
 #[embassy_executor::task]
-async fn switch_controller(mut switch_pin: Option<GpioPin>) -> ! {
+async fn switch_controller(mut switch_output: SwitchOutput) -> ! {
     let mut is_on = false;
-    if let Some(pin) = switch_pin.as_mut() {
-        pin.set(false);
-        set_status_led(false);
+    if switch_output.set(false) {
         publish_switch_state(SwitchState::Off);
+        set_status_led(false);
         info!("Switch state -> OFF");
         info!("Ready: press button to toggle `switch0` output");
     } else {
-        set_status_led(false);
         publish_switch_state(SwitchState::Unavailable);
+        set_status_led(false);
         warn!("Degraded mode: `switch0` output unavailable; switch forced OFF");
     }
-    if should_confirm_boot_image(switch_pin.is_some(), cfg!(dt = "aliases::switch0")) {
+    if should_confirm_boot_image(switch_output.is_available(), cfg!(dt = "aliases::switch0")) {
         confirm_boot_image();
     } else {
         warn!("Skipping MCUboot image confirmation due to unavailable `switch0` output");
     }
+    supervise_watchdog();
 
-    let receiver = COMMAND_CHANNEL.receiver();
     loop {
         log_dropped_commands_if_any();
-        let cmd = receiver.receive().await;
+        let cmd = match next_controller_event().await {
+            ControllerEvent::WatchdogTick => {
+                supervise_watchdog();
+                continue;
+            }
+            ControllerEvent::Command(cmd) => cmd,
+        };
+        supervise_watchdog();
         log_dropped_commands_if_any();
 
-        match evaluate_command(&mut is_on, switch_pin.is_some(), cmd) {
+        match evaluate_command(&mut is_on, switch_output.is_available(), cmd) {
             StateTransition::Changed(new_state) => {
-                if let Some(pin) = switch_pin.as_mut() {
-                    pin.set(new_state);
-                }
-                set_status_led(new_state);
-                publish_switch_state(if new_state {
-                    SwitchState::On
+                if switch_output.set(new_state) {
+                    publish_switch_state(if new_state {
+                        SwitchState::On
+                    } else {
+                        SwitchState::Off
+                    });
+                    set_status_led(new_state);
+                    info!("Switch state -> {}", if new_state { "ON" } else { "OFF" });
                 } else {
-                    SwitchState::Off
-                });
-                info!("Switch state -> {}", if new_state { "ON" } else { "OFF" });
+                    is_on = false;
+                    set_status_led(false);
+                }
             }
             StateTransition::Unchanged(_) => {}
             StateTransition::Unavailable => {
@@ -392,11 +497,13 @@ extern "C" fn rust_main() {
     }
 
     info!("Booting remote_switch (Rust on Zephyr)");
-    let switch_pin = init_switch_pin();
+    let switch_output = SwitchOutput::init();
+    start_watchdog();
     init_remote_control();
 
-    // SAFETY: Called once from thread context after the remote key and replay counter are
-    // initialized, so the cellular thread never observes a half-initialized handler.
+    // SAFETY: Called once from thread context after `SwitchOutput::init()`, the remote key,
+    // and the replay counter are initialized, so the cellular thread never observes a
+    // half-initialized handler or bogus initial `unavailable` state.
     let err = unsafe { cellular_start() };
     if err != 0 {
         warn!("Cellular link not started ({err}); remote control unavailable");
@@ -404,224 +511,9 @@ extern "C" fn rust_main() {
 
     let executor = EXECUTOR.init(Executor::new());
     executor.run(|spawner| {
-        spawner.spawn(switch_controller(switch_pin).unwrap());
+        spawner.spawn(switch_controller(switch_output).unwrap());
     });
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use std::sync::{Mutex, PoisonError};
-
-    static FFI_TEST_LOCK: Mutex<()> = Mutex::new(());
-
-    fn with_isolated_queue<F: FnOnce()>(f: F) {
-        let _guard = FFI_TEST_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
-        while COMMAND_CHANNEL.try_receive().is_ok() {}
-        let _ = take_dropped_commands();
-        f();
-        while COMMAND_CHANNEL.try_receive().is_ok() {}
-        let _ = take_dropped_commands();
-    }
-
-    #[test]
-    fn resolve_covers_all_command_variants() {
-        assert!(SwitchCommand::Toggle.resolve(false));
-        assert!(!SwitchCommand::Toggle.resolve(true));
-        assert!(!SwitchCommand::Set(false).resolve(false));
-        assert!(!SwitchCommand::Set(false).resolve(true));
-        assert!(SwitchCommand::Set(true).resolve(false));
-        assert!(SwitchCommand::Set(true).resolve(true));
-    }
-
-    #[test]
-    fn toggle_transitions_between_off_and_on() {
-        let mut is_on = false;
-        assert_eq!(
-            evaluate_command(&mut is_on, true, SwitchCommand::Toggle),
-            StateTransition::Changed(true)
-        );
-        assert!(is_on);
-
-        assert_eq!(
-            evaluate_command(&mut is_on, true, SwitchCommand::Toggle),
-            StateTransition::Changed(false)
-        );
-        assert!(!is_on);
-    }
-
-    #[test]
-    fn set_is_idempotent_when_state_already_matches() {
-        let mut is_on = false;
-        assert_eq!(
-            evaluate_command(&mut is_on, true, SwitchCommand::Set(false)),
-            StateTransition::Unchanged(false)
-        );
-        assert!(!is_on);
-
-        assert_eq!(
-            evaluate_command(&mut is_on, true, SwitchCommand::Set(true)),
-            StateTransition::Changed(true)
-        );
-        assert!(is_on);
-
-        assert_eq!(
-            evaluate_command(&mut is_on, true, SwitchCommand::Set(true)),
-            StateTransition::Unchanged(true)
-        );
-        assert!(is_on);
-
-        assert_eq!(
-            evaluate_command(&mut is_on, true, SwitchCommand::Set(false)),
-            StateTransition::Changed(false)
-        );
-        assert!(!is_on);
-    }
-
-    #[test]
-    fn degraded_unavailable_output_never_reports_on() {
-        let mut is_on = false;
-        assert_eq!(
-            evaluate_command(&mut is_on, false, SwitchCommand::Set(true)),
-            StateTransition::Unavailable
-        );
-        assert!(!is_on);
-
-        assert_eq!(
-            evaluate_command(&mut is_on, false, SwitchCommand::Set(false)),
-            StateTransition::Unavailable
-        );
-        assert!(!is_on);
-
-        let mut forced_off = true;
-        assert_eq!(
-            evaluate_command(&mut forced_off, false, SwitchCommand::Toggle),
-            StateTransition::Unavailable
-        );
-        assert!(!forced_off);
-    }
-
-    #[test]
-    fn boot_confirmation_withheld_only_when_configured_switch0_fails_init() {
-        assert!(should_confirm_boot_image(true, true));
-        assert!(should_confirm_boot_image(true, false));
-        assert!(should_confirm_boot_image(false, false));
-        assert!(!should_confirm_boot_image(false, true));
-    }
-
-    #[test]
-    fn switch_state_publication_round_trips() {
-        let _guard = FFI_TEST_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
-        for state in [SwitchState::On, SwitchState::Unavailable, SwitchState::Off] {
-            publish_switch_state(state);
-            assert_eq!(published_switch_state(), state);
-            assert_eq!(FirmwarePort.state(), state);
-        }
-    }
-
-    fn call_ffi(message: &[u8]) -> Option<String> {
-        let mut reply = [0u8; protocol::MAX_MESSAGE_LEN];
-        // SAFETY: Both buffers are valid for their full lengths and do not overlap.
-        let len = unsafe {
-            rust_handle_remote_message(
-                message.as_ptr(),
-                message.len(),
-                reply.as_mut_ptr(),
-                reply.len(),
-            )
-        };
-        let len = usize::try_from(len).unwrap();
-        (len > 0).then(|| String::from_utf8(reply[..len].to_vec()).unwrap())
-    }
-
-    #[test]
-    fn ffi_remote_message_authenticates_applies_and_replies() {
-        let key = Key::new([0x42; protocol::KEY_LEN]);
-        let request = |command, counter| {
-            let mut buf = [0u8; protocol::MAX_MESSAGE_LEN];
-            let len = protocol::encode_request(&key, command, counter, &mut buf).unwrap();
-            buf[..len].to_vec()
-        };
-        let reply = |status, counter| {
-            let mut buf = [0u8; protocol::MAX_MESSAGE_LEN];
-            let len = protocol::encode_reply(&key, status, counter, &mut buf).unwrap();
-            String::from_utf8(buf[..len].to_vec()).unwrap()
-        };
-
-        with_isolated_queue(|| {
-            let _ = REMOTE_KEY.init(key.clone());
-            publish_switch_state(SwitchState::Off);
-            let older = REPLAY_GUARD.last() + 1;
-            let fresh = older + 1;
-            use protocol::{RemoteCommand, ReplyStatus};
-
-            assert_eq!(
-                call_ffi(&request(RemoteCommand::On, fresh)),
-                Some(reply(ReplyStatus::On, fresh))
-            );
-            assert_eq!(
-                COMMAND_CHANNEL.try_receive().unwrap(),
-                SwitchCommand::Set(true)
-            );
-
-            // Forged, stale, and null inputs never reach the switch.
-            let mut forged = request(RemoteCommand::Off, fresh + 1);
-            forged[0] = b'x';
-            assert_eq!(call_ffi(&forged), None);
-            assert_eq!(
-                call_ffi(&request(RemoteCommand::Off, older)),
-                Some(reply(ReplyStatus::Stale, fresh))
-            );
-            let mut buf = [0u8; 8];
-            // SAFETY: Null pointers are rejected before any dereference.
-            assert_eq!(
-                unsafe { rust_handle_remote_message(core::ptr::null(), 4, buf.as_mut_ptr(), 8) },
-                0
-            );
-            assert!(COMMAND_CHANNEL.try_receive().is_err());
-            publish_switch_state(SwitchState::Off);
-        });
-    }
-
-    #[test]
-    fn queue_overflow_tracks_drops_preserves_fifo_and_recovers() {
-        with_isolated_queue(|| {
-            for i in 0..COMMAND_QUEUE_CAPACITY {
-                if i % 2 == 0 {
-                    assert!(rust_on_local_button_press());
-                } else {
-                    assert!(FirmwarePort.request(true));
-                }
-            }
-            assert_eq!(take_dropped_commands(), 0);
-
-            assert!(!rust_on_local_button_press());
-            assert!(!FirmwarePort.request(false));
-            assert!(!FirmwarePort.request(true));
-            assert_eq!(take_dropped_commands(), 3);
-            assert_eq!(take_dropped_commands(), 0);
-
-            // Drain one slot and confirm the queue immediately accepts a new command.
-            assert_eq!(
-                COMMAND_CHANNEL.try_receive().unwrap(),
-                SwitchCommand::Toggle
-            );
-            assert!(FirmwarePort.request(false));
-            assert_eq!(take_dropped_commands(), 0);
-
-            for i in 1..COMMAND_QUEUE_CAPACITY {
-                let expected = if i % 2 == 0 {
-                    SwitchCommand::Toggle
-                } else {
-                    SwitchCommand::Set(true)
-                };
-                assert_eq!(COMMAND_CHANNEL.try_receive().unwrap(), expected);
-            }
-            assert_eq!(
-                COMMAND_CHANNEL.try_receive().unwrap(),
-                SwitchCommand::Set(false)
-            );
-            assert!(COMMAND_CHANNEL.try_receive().is_err());
-        });
-    }
-}
+mod tests;

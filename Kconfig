@@ -11,7 +11,8 @@ config REMOTE_SWITCH_KEY
 	  disables remote control (commands are dropped).
 
 	  Never commit a real key. Generate one into the git-ignored file
-	  `remote_switch.local.conf` with `tools/rsctl.py keygen`; CMakeLists.txt
+	  `remote_switch.local.conf` with
+	  `tools/rsctl.py keygen -o remote_switch.local.conf`; CMakeLists.txt
 	  merges that file into the build automatically when it exists.
 
 config REMOTE_SWITCH_CELLULAR
@@ -39,8 +40,70 @@ config REMOTE_SWITCH_PDN_RECOVERY_TIMEOUT
 	default 300
 	range 60 86400
 
+config REMOTE_SWITCH_CELLULAR_WATCHDOG_TIMEOUT
+	int "Seconds without cellular thread progress before withholding watchdog feed"
+	default 900
+	range 180 3600
+	depends on REMOTE_SWITCH_WATCHDOG
+	help
+	  Maximum interval the cellular transport thread may go without
+	  recording loop progress before `switch_controller` stops feeding the
+	  hardware watchdog and allows `watchdog0` to reset the SoC. Generous
+	  enough to span initial modem setup and fault recovery while ensuring a
+	  hung modem IPC, AT command, or socket operation cannot leave remote
+	  control permanently dead.
+
 endif # REMOTE_SWITCH_CELLULAR
 
+config REMOTE_SWITCH_WATCHDOG
+	bool "Hardware watchdog supervision from switch_controller"
+	default y
+	depends on WATCHDOG
+	help
+	  Arm the SoC hardware watchdog (`aliases::watchdog0`) and feed it from
+	  the async `switch_controller` executor task (gated on cellular thread
+	  liveness when enabled) so an I2C bus hang, hung modem IPC, or
+	  scheduler livelock resets the SoC and returns `switch0` to OFF.
+
+if REMOTE_SWITCH_WATCHDOG
+
+config REMOTE_SWITCH_WATCHDOG_TIMEOUT_MS
+	int "Hardware watchdog timeout in milliseconds"
+	default 30000
+	range 3000 600000
+	help
+	  SoC reset timeout for `watchdog0`. A kernel timer wakes
+	  `switch_controller` every one-third of this interval to feed the
+	  watchdog while idle.
+
+endif # REMOTE_SWITCH_WATCHDOG
+
+config REMOTE_SWITCH_DEBUG_SHELL
+	bool "Debug shell on console UART (`rs msg` and raw `at` commands)"
+	default n
+	select SHELL
+	imply AT_SHELL
+	help
+	  Enable the interactive UART shell with the authenticated `rs msg`
+	  command and raw `at` modem access. Disabled by default so production
+	  builds do not expose unauthenticated UART/AT commands or spend flash
+	  and RAM on the shell subsystem. Enable for bench testing via
+	  `CONFIG_REMOTE_SWITCH_DEBUG_SHELL=y` in `remote_switch.local.conf` or
+	  `-Dremote_switch_CONFIG_REMOTE_SWITCH_DEBUG_SHELL=y`.
+
 endmenu
+
+if REMOTE_SWITCH_DEBUG_SHELL
+
+configdefault SHELL_STACK_SIZE
+	default 4096
+
+configdefault SHELL_WILDCARD
+	default n
+
+configdefault LTE_SHELL
+	default n
+
+endif # REMOTE_SWITCH_DEBUG_SHELL
 
 source "Kconfig.zephyr"

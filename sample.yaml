@@ -26,3 +26,6 @@ common:
     - rust
 tests:
   sample.remote_switch.build: {}
+  sample.remote_switch.debug_shell:
+    extra_configs:
+      - CONFIG_REMOTE_SWITCH_DEBUG_SHELL=y
