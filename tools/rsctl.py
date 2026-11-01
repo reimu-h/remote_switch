@@ -39,6 +39,17 @@ MAX_COUNTER = (1 << 64) - 1
 MAX_COUNTER_DIGITS = 20
 HEX_DIGITS = frozenset("0123456789abcdefABCDEF")
 KEY_RE = re.compile(r'^\s*CONFIG_REMOTE_SWITCH_KEY\s*=\s*"([0-9a-fA-F]{64})"\s*$', re.M)
+RAW_KEY_RE = re.compile(r"^[0-9a-fA-F]{64}$")
+
+
+def parse_key_text(text: str) -> bytes:
+    match = KEY_RE.search(text)
+    if match:
+        return bytes.fromhex(match.group(1))
+    stripped = text.strip().strip("\"'")
+    if RAW_KEY_RE.fullmatch(stripped):
+        return bytes.fromhex(stripped)
+    raise ValueError('expected CONFIG_REMOTE_SWITCH_KEY="<64 hex digits>" or 64 hex digits')
 
 
 def load_key(path: pathlib.Path) -> bytes:
@@ -170,11 +181,12 @@ def cmd_payload(args) -> None:
     print(make_request(key, args.command, counter))
 
 
-def exchange(sock, key, request: str, counter: int, args):
+def exchange(sock, key, request: str, counter: int, host: str, port: int, timeout: float,
+             retries: int):
     """Sends `request` until an authentic reply for `counter` arrives (or retries run out)."""
-    for attempt in range(1, args.retries + 1):
-        sock.sendto(request.encode(), (args.host, args.port))
-        deadline = time.monotonic() + args.timeout
+    for attempt in range(1, retries + 1):
+        sock.sendto(request.encode(), (host, port))
+        deadline = time.monotonic() + timeout
         while (remaining := deadline - time.monotonic()) > 0:
             sock.settimeout(remaining)
             try:
@@ -184,37 +196,50 @@ def exchange(sock, key, request: str, counter: int, args):
             reply = parse_reply(key, data.decode("ascii", errors="replace"))
             if reply is None:
                 print(f"ignoring unauthenticated reply: {data!r}", file=sys.stderr)
-            elif reply[0] == "stale" or reply[1] == counter:
+            elif (reply[0] == "stale" and reply[1] >= counter) or (
+                reply[0] != "stale" and reply[1] == counter
+            ):
                 return reply
-        print(f"no reply (attempt {attempt}/{args.retries})", file=sys.stderr)
+        print(f"no reply (attempt {attempt}/{retries})", file=sys.stderr)
     return None
+
+
+def send_command(
+    key: bytes,
+    command: str,
+    host: str,
+    port: int = DEFAULT_PORT,
+    timeout: float = 10.0,
+    retries: int = 3,
+    minimum: int = 1,
+) -> tuple[str, int] | None:
+    """Sends an authenticated command over UDP, resynchronizing once on `stale`."""
+    counter = new_counter(minimum)
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+        reply = exchange(sock, key, make_request(key, command, counter), counter, host, port,
+                         timeout, retries)
+        if reply and reply[0] == "stale" and reply[1] < MAX_COUNTER:
+            counter = new_counter(max(counter + 1, reply[1] + 1))
+            reply = exchange(sock, key, make_request(key, command, counter), counter, host, port,
+                             timeout, retries)
+    return reply
 
 
 def cmd_send(args) -> int:
     key = load_key(args.config)
     try:
-        counter = new_counter()
+        reply = send_command(key, args.command, args.host, args.port, args.timeout, args.retries)
     except ValueError as e:
         print(f"error: {e}", file=sys.stderr)
         return 1
-    try:
-        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
-            reply = exchange(sock, key, make_request(key, args.command, counter), counter, args)
-            if reply and reply[0] == "stale":
-                if reply[1] >= MAX_COUNTER:
-                    print("error: device replay counter is exhausted (u64::MAX)",
-                          file=sys.stderr)
-                    return 2
-                # The device has seen a newer counter (e.g. clock skew or same-ms
-                # command); retry just above it.
-                counter = new_counter(reply[1] + 1)
-                reply = exchange(sock, key, make_request(key, args.command, counter), counter,
-                                 args)
     except OSError as e:
         detail = e.strerror or str(e)
         print(f"error: UDP communication with {args.host}:{args.port} failed: {detail}",
               file=sys.stderr)
         return 1
+    if reply and reply[0] == "stale" and reply[1] >= MAX_COUNTER:
+        print("error: device replay counter is exhausted (u64::MAX)", file=sys.stderr)
+        return 2
     if reply is None:
         print("error: no authentic reply; check the host/port, VPN tunnel, and key",
               file=sys.stderr)

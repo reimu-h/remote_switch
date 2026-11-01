@@ -1,0 +1,55 @@
+# SPDX-License-Identifier: MIT
+
+services:
+  openvpn:
+    build:
+      context: ..
+      dockerfile: telegram_bot/Dockerfile
+      target: openvpn
+    cap_drop: [ALL]
+    cap_add: [NET_ADMIN, DAC_READ_SEARCH, SETUID, SETGID]
+    security_opt: ["no-new-privileges:true"]
+    devices: ["/dev/net/tun:/dev/net/tun"]
+    volumes:
+      - ./client.ovpn:/vpn/client.ovpn:ro
+    command:
+      - openvpn
+      - --config
+      - /vpn/client.ovpn
+      - --script-security
+      - "1"
+      - --pull-filter
+      - ignore
+      - redirect-gateway
+      - --pull-filter
+      - ignore
+      - dhcp-option
+      - --data-ciphers
+      - AES-256-GCM:AES-128-GCM:CHACHA20-POLY1305:AES-256-CBC
+      - --auth-nocache
+      - --resolv-retry
+      - infinite
+      - --persist-key
+      - --persist-tun
+    healthcheck:
+      test: ["CMD-SHELL", "ip -4 addr show dev tun0 2>/dev/null | grep -q 'inet '"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  rsbot:
+    build:
+      context: ..
+      dockerfile: telegram_bot/Dockerfile
+      target: rsbot
+    network_mode: "service:openvpn"
+    depends_on:
+      openvpn:
+        condition: service_healthy
+    env_file:
+      - ${ENV_FILE:-.env}
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    restart: unless-stopped

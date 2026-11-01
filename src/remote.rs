@@ -254,6 +254,8 @@ fn apply(port: &impl SwitchPort, command: RemoteCommand) -> ReplyStatus {
         ReplyStatus::Unavailable
     } else if !port.request(on) {
         ReplyStatus::Busy
+    } else if port.state() == SwitchState::Unavailable {
+        ReplyStatus::Unavailable
     } else if on {
         ReplyStatus::On
     } else {
@@ -601,6 +603,38 @@ mod tests {
     }
 
     #[test]
+    fn runtime_gpio_failure_during_request_reports_unavailable() {
+        struct PreemptFailPort {
+            state: Mutex<SwitchState>,
+        }
+
+        impl SwitchPort for PreemptFailPort {
+            fn state(&self) -> SwitchState {
+                *self.state.lock().unwrap()
+            }
+
+            fn request(&self, _on: bool) -> bool {
+                // Simulate high-priority controller preempting and marking GPIO unavailable.
+                *self.state.lock().unwrap() = SwitchState::Unavailable;
+                true
+            }
+
+            fn persist_counter(&self, _counter: u64) -> bool {
+                true
+            }
+        }
+
+        let guard = ReplayGuard::new();
+        let port = PreemptFailPort {
+            state: Mutex::new(SwitchState::Off),
+        };
+        assert_eq!(
+            handle_message(&key(), &guard, &port, &msg(RemoteCommand::On, 1)).unwrap(),
+            (ReplyStatus::Unavailable, 1)
+        );
+    }
+
+    #[test]
     fn concurrent_transports_never_apply_older_counter_after_newer() {
         let guard = ReplayGuard::new();
         let port = MockPort::new(SwitchState::Off);
@@ -621,7 +655,12 @@ mod tests {
                 scope.spawn(move || {
                     let encoded = msg(command, counter);
                     barrier.wait();
-                    let _ = handle_message(&key(), guard, port, &encoded).unwrap();
+                    match handle_message(&key(), guard, port, &encoded) {
+                        Ok((ReplyStatus::On | ReplyStatus::Off, c)) => assert_eq!(c, counter),
+                        Ok((ReplyStatus::Stale, last)) => assert!(last > counter),
+                        Err(RequestError::RateLimited) => {}
+                        other => panic!("unexpected outcome for counter {counter}: {other:?}"),
+                    }
                 });
             }
         });

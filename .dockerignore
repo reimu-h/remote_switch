@@ -1,0 +1,8 @@
+# SPDX-License-Identifier: MIT
+
+# Allowlist-only Docker build context so private keys, .env files, OpenVPN
+# profiles, and firmware/Rust build artifacts never enter image layers.
+*
+!tools/
+!tools/rsctl.py
+!tools/rsbot.py

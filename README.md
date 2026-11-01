@@ -11,6 +11,7 @@ Zephyr RTOS + Rust (`zephyr-lang-rust` / Embassy) firmware application for drivi
 - **Low-Data Cellular Transport (`src/cellular.c`)**: Attaches over LTE-M (NB-IoT fallback) with an IPv4-only PDN and serves commands on a UDP port. It sends nothing while idle and one ~60-byte reply per fresh authenticated command (plus a small bounded retry budget for duplicate or stale requests). Unauthenticated or excess replayed datagrams are dropped without a reply. See [Remote Control over Cellular](#remote-control-over-cellular).
 - **C Board I/O Shim (`src/board_io.h`, `src/board_io.c`)**: Configures `aliases::switch0` inactive during `POST_KERNEL` initialization with checked GPIO driver return codes, bridges debounced local button events (`aliases::sw0` via Zephyr's `input` subsystem) into Rust, drives the onboard nPM1300 PMIC host status LED (`npm1300_leds` channel 2 over I2C), arms and feeds `aliases::watchdog0`, provides runtime MCUboot image confirmation (`board_confirm_image()`), and persists the replay counter with Zephyr settings on NVS (`storage_partition`).
 - **Host CLI (`tools/rsctl.py`)**: Generates the key, signs commands, and sends them over UDP, verifying the authenticated reply. Uses only the Python standard library.
+- **Telegram Bot & VPS Stack (`tools/rsbot.py`, `telegram_bot/`)**: Stdlib-only Python Telegram bot supporting `/on`, `/off`, `/status`, and inline control buttons with strict Telegram user/chat ID allowlists, paired with a hardened Docker Compose stack (including an isolated OpenVPN sidecar for the 1NCE tunnel).
 - **Non-Secure Partitioning & Bootloader (`sysbuild.conf`, `sysbuild/mcuboot.conf`, `sysbuild/remote_switch.conf`)**: Builds with Zephyr Sysbuild, pairing MCUboot (`64 KB`) with TF-M secure firmware (`256 KB`) and the non-secure Rust/C application (`192 KB` slot, with MCUboot DFU image confirmation configured for sysbuild targets).
 
 ## Hardware & Pin Mapping
@@ -97,6 +98,7 @@ Protocol, replay-protection, state-machine, bounded-queue, drop-counter, and FFI
 ```sh
 cargo test --manifest-path remote_switch/Cargo.toml
 cargo fmt --manifest-path remote_switch/Cargo.toml -- --check
+python3 -m unittest discover -s remote_switch/tools
 ```
 
 If dependencies are already cached locally, append `--offline` to `cargo test`.
@@ -194,6 +196,19 @@ The SIM's private IP address can only be reached from inside the carrier network
   ```
   `rsctl.py` retries lost datagrams with the same counter. A retry gets the current state but is not applied again. If the device reports a newer counter (`stale`), the tool resynchronizes once.
 - **Other transports:** `rsctl.py payload on` prints a signed one-line message. Any transport that delivers that line as a UDP datagram to port `4242` works, such as a server inside the VPN or a carrier API that sends UDP downlink. The reply goes back to the sender's address.
+
+### Telegram Bot on a VPS (Docker Compose)
+
+`tools/rsbot.py` and `telegram_bot/` control the switch from Telegram (`/on`, `/off`, `/status`, `/help`, plus inline buttons) without exposing inbound ports:
+
+```sh
+cd remote_switch/telegram_bot
+cp /path/to/1nce-client.ovpn client.ovpn && chmod 600 client.ovpn
+cp .env.example .env && chmod 600 .env   # set TELEGRAM_BOT_TOKEN, TELEGRAM_ALLOWED_USERS, RS_HOST, RS_KEY
+docker compose up -d --build
+```
+
+`docker-compose.yml` runs OpenVPN inside an isolated container (`--pull-filter ignore redirect-gateway` so VPS SSH and `api.telegram.org` routing are unaffected) and runs `rsbot` in its network namespace (restricting commands to private 1:1 DMs with `TELEGRAM_ALLOWED_USERS` by default, or specific chat IDs via `TELEGRAM_ALLOWED_CHATS`). If you recreate `openvpn`, run `docker compose up -d --force-recreate` so `rsbot` re-attaches cleanly to the new tunnel namespace. OpenVPN keep-alives stay between the VPS and 1NCE's VPN concentrator, so idle SIM cellular usage remains 0 bytes.
 
 ### Protocol
 

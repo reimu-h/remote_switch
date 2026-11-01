@@ -5,6 +5,7 @@
 /twister-out*/
 /target/
 __pycache__/
+*.py[cod]
 
 # Local Zephyr-generated Cargo and IDE state (may contain host paths)
 /.cargo/
@@ -23,6 +24,8 @@ compile_commands.json
 *.pk8
 .env
 .env.*
+!.env.example
+*.ovpn
 
 # OS and editor swap/metadata files
 .DS_Store
