@@ -19,7 +19,8 @@ Default peripheral assignments on `circuitdojo_feather_nrf9151/nrf9151/ns`:
 
 | Function | Devicetree Node / Alias | Default Pin / Bus | Notes |
 | --- | --- | --- | --- |
-| Switch actuator output | `aliases::switch0` (`&switch_out`) | Header **`D2`** (`P0.26`, `GPIO_ACTIVE_HIGH`) | Configured in `boards/circuitdojo_feather_nrf9151_ns.overlay` |
+| Switch actuator output | `aliases::switch0` (`&switch_out`) | Header **`D2`** (`P0.26`, `GPIO_ACTIVE_HIGH`, `3.3 V`) | Configured in `boards/circuitdojo_feather_nrf9151_ns.overlay` |
+| GPIO / `3V3` supply (`VDDIO`) | `&npm1300_buck1` (`BUCK1`) | `i2c2` (`P0.02` SDA / `P0.01` SCL) | Stepped from `2.7 V` power-on default to `3.3 V` in `POST_KERNEL` |
 | Local toggle button | `aliases::sw0` (`&button0`) | Onboard **`MODE`** button (`P0.03`) | Debounced `gpio-keys` input (`INPUT_KEY_0`) |
 | Status indicator LED | `npm1300_leds` (channel `2`) | `i2c2` (`P0.02` SDA / `P0.01` SCL) | nPM1300 PMIC host-controlled blue LED |
 | Console UART | `zephyr,console` (`&uart0`) | `P0.11` TX / `P0.10` RX (`115200 8N1`) | Serial logs and opt-in debug shell (`CONFIG_REMOTE_SWITCH_DEBUG_SHELL=y`) |

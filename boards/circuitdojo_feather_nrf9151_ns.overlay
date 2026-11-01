@@ -3,9 +3,11 @@
 /*
  * Devicetree overlay for Circuit Dojo nRF9151 Feather (non-secure).
  *
- * Default switch output is mapped to Feather header pin D2 (P0.26), active-high.
- * Update `&gpio0 26` (and polarity if needed) to match your relay or MOSFET
- * driver circuit, or supply a local `*.local.overlay` via `-DDTC_OVERLAY_FILE`.
+ * - Default switch output is mapped to Feather header pin D2 (P0.26), active-high.
+ *   Update `&gpio0 26` (and polarity if needed) to match your relay or MOSFET
+ *   driver circuit, or supply a local `*.local.overlay` via `-DDTC_OVERLAY_FILE`.
+ * - nPM1300 BUCK1 (`VDDIO` / `3V3`) defaults to 2.7 V via hardware VSET resistors;
+ *   `&npm1300_buck1` is configured to 3.3 V so GPIO outputs drive 3.3 V logic.
  *
  * Note: `compatible = "gpio-leds"` provides the `gpios` binding for the
  * `switch0` alias (detected via `cfg!(dt = "aliases::switch0")` in Rust and
@@ -34,4 +36,9 @@
 			label = "Remote Switch Output";
 		};
 	};
+};
+
+&npm1300_buck1 {
+	regulator-min-microvolt = <3300000>;
+	regulator-init-microvolt = <3300000>;
 };
